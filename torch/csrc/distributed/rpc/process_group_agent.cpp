@@ -214,39 +214,83 @@ void ProcessGroupAgent::enqueueSend(SendWork work) {
   // NB: this can be changed to use a native move capture when moved to C++14
   threadPool_.run(std::bind(
       [&](const SendWork& work) {
-        std::stringstream ss;
-        serialize(work.message_, ss);
-        std::string serializedPayload = ss.str();
+        try {
+          std::stringstream ss;
+          serialize(work.message_, ss);
+          std::string serializedPayload = ss.str();
 
-        std::vector<torch::Tensor> preamble = {torch::tensor(
-            {(int64_t)pg_->getRank(),
-             (int64_t)serializedPayload.length(),
-             (int64_t)work.message_.type()},
-            {torch::kLong})};
+          std::vector<torch::Tensor> preamble = {torch::tensor(
+              {(int64_t)pg_->getRank(),
+               (int64_t)serializedPayload.length(),
+               (int64_t)work.message_.type()},
+              {torch::kLong})};
 
-        // ProcessGroup is not thread-safe when sending with the same tag, hence
-        // the lock
-        std::vector<std::shared_ptr<c10d::ProcessGroup::Work>> pendingSends;
-        const auto& dst = work.to_.id_;
-        if (work.message_.isShutdown()) {
-          pendingSends.reserve(1);
-          std::lock_guard<std::mutex> guard(sendMutexes_[dst]);
-          pendingSends.emplace_back(
-              pg_->send(preamble, dst, dst /* channelTag */));
-        } else {
-          std::vector<torch::Tensor> payload = {torch::from_blob(
+          // ProcessGroup is not thread-safe when sending with the same tag, hence
+          // the lock
+          std::vector<std::shared_ptr<c10d::ProcessGroup::Work>> pendingSends;
+          const auto& dst = work.to_.id_;
+          if (work.message_.isShutdown()) {
+            pendingSends.reserve(1);
+            std::lock_guard<std::mutex> guard(sendMutexes_[dst]);
+            pendingSends.emplace_back(
+                pg_->send(preamble, dst, dst /* channelTag */));
+          } else {
+            std::vector<torch::Tensor> payload = {torch::from_blob(
+                (void*)serializedPayload.c_str(),
+                serializedPayload.length(),
+                {torch::kChar})};
+            pendingSends.reserve(2);
+            std::lock_guard<std::mutex> guard(sendMutexes_[dst]);
+            pendingSends.emplace_back(
+                pg_->send(preamble, dst, dst /* channelTag */));
+            pendingSends.emplace_back(
+                pg_->send(payload, dst, dst /* channelTag */));
+          }
+          for (auto& pendingSend : pendingSends) {
+            pendingSend->wait();
+          }
+        } catch (std::exception& e) {
+          const int64_t msgId = work.message_.id();
+          Message excMsg = createException(work.message_, e);
+
+          if (work.message_.requiresResponse()) {
+            // client encountered exception while making RPC.
+            // mark future as completed with exception message
+            // and remove pointer from ``futures_``
+            std::lock_guard<std::mutex> lock{futureMutex_};
+            futures_[msgId]->markCompleted(std::move(excMsg));
+            futures_.erase(msgId);
+          } else if (work.message_.isResponse()) {
+            // server encountered exception while responding to RPC.
+            // substitute ``work.message_`` for error message
+            // and ``enqueueSend`` otherwise as normal.
+            std::stringstream ss;
+            serialize(std::move(excMsg), ss);
+            std::string serializedPayload = ss.str();
+            std::vector<torch::Tensor> preamble = {torch::tensor(
+              {(int64_t)pg_->getRank(),
+               (int64_t)serializedPayload.length(),
+               (int64_t)MessageType::EXCEPTION},
+              {torch::kLong})};
+
+            std::vector<torch::Tensor> payload = {torch::from_blob(
               (void*)serializedPayload.c_str(),
               serializedPayload.length(),
               {torch::kChar})};
-          pendingSends.reserve(2);
-          std::lock_guard<std::mutex> guard(sendMutexes_[dst]);
-          pendingSends.emplace_back(
-              pg_->send(preamble, dst, dst /* channelTag */));
-          pendingSends.emplace_back(
-              pg_->send(payload, dst, dst /* channelTag */));
-        }
-        for (auto& pendingSend : pendingSends) {
-          pendingSend->wait();
+
+            const worker_id_t& dst = work.to_.id_;
+            std::shared_ptr<c10d::ProcessGroup::Work> preambleSend;
+            std::shared_ptr<c10d::ProcessGroup::Work> payloadSend;
+            {
+                std::lock_guard<std::mutex> guard(sendMutexes_[dst]);
+                preambleSend = pg_->send(preamble, dst, dst);
+                payloadSend = pg_->send(payload, dst, dst);
+            }
+            preambleSend->wait();
+            payloadSend->wait();
+          }
+
+          throw e;
         }
       },
       std::move(work)));
